@@ -203,70 +203,153 @@ def main() -> int:
     сохраняет значения для всех вершин и метаданные методов, затем создаёт топы.
     Режим --rank-only читает готовый результат без пересчёта центральностей.
     """
+
+    # Читаем пути к файлам, параметры выборки и нужный режим запуска.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nodes", type=Path, default=Path("data/nodes.csv"))
     parser.add_argument("--edges", type=Path, default=Path("data/edges.csv"))
     parser.add_argument("--out", type=Path, default=Path("data/centrality.csv"))
-    parser.add_argument("--samples", type=int, default=128, help="sampled sources; closeness samples per component (default: 128)")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=128,
+        help="sampled sources; closeness samples per component (default: 128)",
+    )
     parser.add_argument("--random-seed", type=int, default=42)
-    parser.add_argument("--exact", action="store_true", help="use all sources; very slow on large graphs")
-    parser.add_argument("--top", type=int, default=10, help="ranking size for each metric")
-    parser.add_argument("--rank-only", action="store_true", help="export tops from the existing --out CSV")
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="use all sources; very slow on large graphs",
+    )
+    parser.add_argument(
+        "--top", type=int, default=10, help="ranking size for each metric"
+    )
+    parser.add_argument(
+        "--rank-only",
+        action="store_true",
+        help="export tops from the existing --out CSV",
+    )
     args = parser.parse_args()
+
+    # Отсекаем некорректные размеры топа и выборки до начала вычислений.
     if args.top < 1 or args.samples < 2:
         parser.error("--top must be positive; --samples must be at least 2")
+
+    # Для топов из готового CSV не нужны ни загрузка графа, ни igraph и NumPy.
+    # --exact здесь запрещён: готовые оценки в этом режиме не пересчитываются.
     if args.rank_only:
         if args.exact:
             parser.error("--rank-only cannot recalculate scores with --exact")
+
         print(f"Rankings: {export_top_rankings(args.out, args.top).resolve()}")
         return 0
+
+    # Остальные режимы рассчитывают центральности и требуют обе библиотеки.
     if ig is None or np is None:
         parser.error("Install requirements.txt and run with .venv/bin/python")
-    inputs = {"nodes": file_signature(args.nodes), "edges": file_signature(args.edges)}
+
+    # Запоминаем состояние входных файлов, чтобы позднее заметить их изменение.
+    inputs = {
+        "nodes": file_signature(args.nodes),
+        "edges": file_signature(args.edges),
+    }
+
+    # Загружаем граф и проверяем, что в нём есть хотя бы одна вершина.
     log("Loading graph with igraph...")
     graph, ids = load_native_graph(args.nodes, args.edges)
     n = graph.vcount()
     if n == 0:
         parser.error("The graph contains no nodes")
+
+    # Разбиваем граф на связные части. В точном режиме источниками будут все вершины.
     groups = list(graph.connected_components())
     samples = n if args.exact else args.samples
     log(f"Graph: {n:,} nodes; {graph.ecount():,} edges; {len(groups):,} components.")
     log(f"Mode: {'EXACT' if samples >= n else f'APPROXIMATE, sources={samples}, seed={args.random_seed}'}")
+
+    # Каждый расчёт возвращает массив оценок для всех вершин, даже при выборке.
     values = {
         "closeness": native_closeness(graph, groups, samples, args.random_seed),
         "eigenvector": native_eigenvector(graph, groups),
         "betweenness": native_betweenness(graph, samples, args.random_seed),
     }
-    if inputs != {"nodes": file_signature(args.nodes), "edges": file_signature(args.edges)}:
-        raise RuntimeError("Graph files changed during analysis; rerun on a stable snapshot")
+
+    # Не сохраняем результат, если сборщик успел изменить граф во время анализа.
+    if inputs != {
+        "nodes": file_signature(args.nodes),
+        "edges": file_signature(args.edges),
+    }:
+        raise RuntimeError(
+            "Graph files changed during analysis; rerun on a stable snapshot"
+        )
+
+    # Пишем оценки всех вершин во временный CSV, сохраняя прежний файл до конца записи.
     args.out.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.out.with_suffix(args.out.suffix + ".tmp")
     progress = Progress("Writing centrality CSV", n)
     columns = ("betweenness", "closeness", "eigenvector")
+
     with temporary.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(["id", *columns])
+
         for index, user in enumerate(ids):
-            writer.writerow([int(user), *(float(values[name][index]) for name in columns)])
+            writer.writerow([
+                int(user),
+                *(float(values[name][index]) for name in columns),
+            ])
             if (index + 1) % 50000 == 0 or index + 1 == n:
                 progress.update(index + 1)
+
+    # Метаданные объясняют, какие оценки точные, а какие получены по выборке.
+    # Имя выходного файла произвольно и само по себе не определяет точность.
     metadata = {
-        **inputs, "vertex_count": n, "edge_count": graph.ecount(), "component_count": len(groups),
-        "exact": samples >= n, "samples": samples, "random_seed": args.random_seed,
+        **inputs,
+        "vertex_count": n,
+        "edge_count": graph.ecount(),
+        "component_count": len(groups),
+        "exact": samples >= n,
+        "samples": samples,
+        "random_seed": args.random_seed,
         "igraph_version": ig.__version__,
-        "betweenness_method": "exact" if samples >= n else "uniform source sampling, scaled by n/k",
-        "closeness_method": "exact WF" if samples >= max(map(len, groups)) else "WF correction times reciprocal sampled mean distance within each component",
-        "eigenvector_method": "native eigensolver, L2 normalized separately per component; singleton=1",
+        "betweenness_method": (
+            "exact" if samples >= n else "uniform source sampling, scaled by n/k"
+        ),
+        "closeness_method": (
+            "exact WF"
+            if samples >= max(map(len, groups))
+            else (
+                "WF correction times reciprocal sampled mean distance "
+                "within each component"
+            )
+        ),
+        "eigenvector_method": (
+            "native eigensolver, L2 normalized separately per component; singleton=1"
+        ),
         "betweenness_sources": min(samples, n),
-        "graph_coverage": "observed graph; missing friend lists and boundary edges can affect scores",
+        "graph_coverage": (
+            "observed graph; missing friend lists and boundary edges can affect scores"
+        ),
     }
+
     metadata_path = args.out.with_suffix(".meta.json")
     metadata_temporary = metadata_path.with_suffix(".json.tmp")
-    metadata_temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata_temporary.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # Заменяем прежние результаты, когда и CSV, и метаданные полностью записаны.
     temporary.replace(args.out)
     metadata_temporary.replace(metadata_path)
+
+    # Из готового CSV выделяем небольшие топы и выводим пути к результатам.
     report = export_top_rankings(args.out, args.top)
-    print(f"Results: {args.out.resolve()}\nMethods: {metadata_path.resolve()}\nRankings: {report.resolve()}")
+    print(
+        f"Results: {args.out.resolve()}\n"
+        f"Methods: {metadata_path.resolve()}\n"
+        f"Rankings: {report.resolve()}"
+    )
     return 0
 
 

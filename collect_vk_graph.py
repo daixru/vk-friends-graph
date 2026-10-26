@@ -258,52 +258,120 @@ def main() -> int:
     Возвращает код завершения: 0 — проход окончен или достигнут лимит профилей,
     2 — ошибка, 130 — прерывание пользователем.
     """
+
+    # Читаем параметры запуска: откуда взять профили и как выполнять сбор.
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seeds", type=Path, default=Path("seeds.csv"), help="CSV: group,profile or one profile per line")
-    parser.add_argument("--out", type=Path, default=Path("data"), help="output directory")
-    parser.add_argument("--delay", type=float, default=1.0, help="fixed seconds between requests (default: 1)")
-    parser.add_argument("--max-users", type=int, default=0, help="limit newly requested profiles; 0 = unlimited")
-    parser.add_argument("--complete-boundary", action="store_true", help="also fetch second-hop lists to find edges within the boundary")
+    parser.add_argument(
+        "--seeds",
+        type=Path,
+        default=Path("seeds.csv"),
+        help="CSV: group,profile or one profile per line",
+    )
+    parser.add_argument(
+        "--out", type=Path, default=Path("data"), help="output directory"
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="fixed seconds between requests (default: 1)",
+    )
+    parser.add_argument(
+        "--max-users",
+        type=int,
+        default=0,
+        help="limit newly requested profiles; 0 = unlimited",
+    )
+    parser.add_argument(
+        "--complete-boundary",
+        action="store_true",
+        help=(
+            "also fetch second-hop lists to find edges within the boundary"
+        ),
+    )
     args = parser.parse_args()
+
+    # Проверяем токен и ограничения до запросов к API и изменения файлов.
     token = os.environ.get("VK_TOKEN")
     if not token:
         parser.error("Set VK_TOKEN in the environment")
+
     if not math.isfinite(args.delay) or args.delay < 0 or args.max_users < 0:
-        parser.error("--delay must be finite and non-negative; --max-users must be non-negative")
+        parser.error(
+            "--delay must be finite and non-negative; --max-users must be non-negative"
+        )
+
+    # Готовим исходные профили, кэш списков и клиент API.
+    # Если подготовка не удалась, существующий граф не перезаписываем.
     try:
         records = load_seeds(args.seeds)
         if not records:
             raise ValueError("No seed profiles found")
+
         args.out.mkdir(parents=True, exist_ok=True)
         cache_path = args.out / "friends_cache.json"
-        cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+        cache = (
+            json.loads(cache_path.read_text(encoding="utf-8"))
+            if cache_path.exists()
+            else {}
+        )
+
         client = VKClient(token, args.delay)
         print("Resolving seed profiles...", file=sys.stderr, flush=True)
         seeds = resolve_seeds(client, records)
+
     except KeyboardInterrupt:
-        print("\nInterrupted before collection; existing data is unchanged.", file=sys.stderr)
+        print(
+            "\nInterrupted before collection; existing data is unchanged.",
+            file=sys.stderr,
+        )
         return 130
+
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         print(f"Cannot start collection: {exc}", file=sys.stderr)
         return 2
 
+    # Собираем списки друзей: два прохода или три при --complete-boundary.
     errors = []
     status = 0
     try:
-        collect_friends(client, seeds, cache, cache_path, errors, 3 if args.complete_boundary else 2, args.max_users)
+        collect_friends(
+            client,
+            seeds,
+            cache,
+            cache_path,
+            errors,
+            3 if args.complete_boundary else 2,
+            args.max_users,
+        )
+
+    # Прерывание или ошибка останавливают запросы, но не сохранение результата.
     except KeyboardInterrupt:
         print("\nInterrupted; saving the partial graph.", file=sys.stderr)
         status = 130
+
     except RuntimeError as exc:
-        print(f"\nCollection stopped: {exc}. Saving the partial graph.", file=sys.stderr)
+        print(
+            f"\nCollection stopped: {exc}. Saving the partial graph.",
+            file=sys.stderr,
+        )
         status = 2
+
+    # Сохраняем всё полученное и строим граф даже после досрочной остановки.
     save_json(cache_path, cache)
     nodes, edges = export_graph(args.out, seeds, cache)
+
+    # Журнал содержит ошибки только текущего запуска и не служит списком запретов.
     with (args.out / "errors.csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=["user_id", "depth", "error"])
         writer.writeheader()
         writer.writerows(errors)
-    print(f"Nodes: {nodes:,}; edges: {edges:,}; errors: {len(errors)}; output: {args.out.resolve()}")
+
+    # Печатаем итог и возвращаем код завершения для терминала или другого скрипта.
+    print(
+        f"Nodes: {nodes:,}; edges: {edges:,}; errors: {len(errors)}; "
+        f"output: {args.out.resolve()}"
+    )
     return status
 
 
