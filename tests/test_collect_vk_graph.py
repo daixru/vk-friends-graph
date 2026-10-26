@@ -29,9 +29,10 @@ class CollectorTests(unittest.TestCase):
             return list(csv.DictReader(file))
 
     def run_main(self, client, *arguments):
-        """Запускает сборщик с подставленным API-клиентом и временными файлами.
+        """Запускает сборщик с имитацией VK API и файлами во временной папке.
 
-        Перехватывает вывод и задаёт тестовый токен, чтобы проверить основной сценарий без сети.
+        Настоящих запросов к VK нет: ответы задаёт тестовый client.
+        Вывод перехватывается, чтобы сообщения сборщика не мешали читать результат теста.
         """
         (self.directory / "seeds.csv").write_text("group,profile\n1,1\n")
         command = ["collect_vk_graph.py", "--seeds", str(self.directory / "seeds.csv"),

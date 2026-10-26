@@ -39,7 +39,7 @@ class AnalysisTests(unittest.TestCase):
             return list(csv.DictReader(stream))
 
     def scores(self, graph, samples=100):
-        """Считает три метрики на тестовом графе с фиксированной выборкой, перехватывая прогресс."""
+        """Считает три показателя тестового графа с seed=42, скрывая сообщения прогресса."""
         with redirect_stderr(io.StringIO()):
             return (analysis.native_betweenness(graph, samples, 42),
                     analysis.native_closeness(graph, list(graph.connected_components()), samples, 42),

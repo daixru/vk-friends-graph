@@ -9,12 +9,14 @@ from pathlib import Path
 
 
 def export_top_rankings(source: Path, top: int = 10) -> Path:
-    """Создаёт отдельные CSV топов и общий Markdown-отчёт по трём центральностям.
+    """Сохраняет три топа в CSV и общий отчёт в Markdown; возвращает путь к отчёту.
 
-    Читает исходный CSV один раз, удерживая в памяти только top лучших записей
-    для каждой метрики. Точность расчёта определяет по метаданным, а не имени
-    файла; при равных значениях ставит меньший ID выше. Проверяет конечность
-    оценок и согласованность числа строк с метаданными. Возвращает путь к отчёту.
+    Читает исходный CSV один раз. Для каждого показателя хранит в памяти только
+    top лучших записей, чтобы не загружать миллионы строк целиком.
+    При одинаковых оценках первым ставит меньший ID. Способ расчёта — точный
+    или приближённый — определяет по метаданным, а не по названию файла.
+    Значения NaN и бесконечность считает ошибкой. Если в метаданных есть число
+    вершин, проверяет, что оно совпадает с числом строк CSV.
     """
     if top < 1:
         raise ValueError("top must be positive")
@@ -22,7 +24,7 @@ def export_top_rankings(source: Path, top: int = 10) -> Path:
     metadata_path = source.with_suffix(".meta.json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
     metrics = ("betweenness", "closeness", "eigenvector")
-    # Корень каждой кучи — худшая запись текущего топа: её первой заменяет лучший кандидат.
+    # heapq держит худшего участника топа в heap[0]: его можно быстро заменить лучшим.
     heaps: dict[str, list[tuple[float, int]]] = {name: [] for name in metrics}
     rows = 0
     with source.open(newline="", encoding="utf-8-sig") as file:
@@ -32,7 +34,7 @@ def export_top_rankings(source: Path, top: int = 10) -> Path:
                 score = float(row[name])
                 if not math.isfinite(score):
                     raise ValueError(f"non-finite {name} for user {user}")
-                item = (score, -user)  # При равной оценке меньший ID должен стоять выше.
+                item = (score, -user)  # Минус перед ID делает больший ID худшим при равной оценке.
                 heap = heaps[name]
                 if len(heap) < top:
                     heapq.heappush(heap, item)
