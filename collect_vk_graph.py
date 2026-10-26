@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect friends within two hops of seed profiles and export an undirected graph."""
+"""Сбор списков друзей VK и построение графа в пределах двух кругов от исходных профилей."""
 
 import argparse
 import csv
@@ -15,29 +15,47 @@ from urllib.parse import unquote, urlencode, urlparse
 
 
 class VKError(RuntimeError):
+    """Ошибка VK API с числовым кодом для выбора дальнейшего действия при сборе."""
+
     def __init__(self, code: int, message: str):
+        """Сохраняет код ошибки отдельно от сообщения, чтобы вызывающий код мог его проверить."""
         self.code = code
         super().__init__(f"VK error {code}: {message}")
 
 
 def save_json(path: Path, value: dict) -> None:
+    """Сохраняет JSON через временный файл и замену исходного файла.
+
+    Старый кэш заменяется только после записи нового содержимого, чтобы
+    не оставлять вместо него частично записанный JSON при прерывании записи.
+    """
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
 
 
 class VKClient:
-    """One request per call, with a fixed interval and no retries or saved state."""
+    """Клиент VK API с постоянным интервалом между запросами, без автоматических повторов."""
 
     def __init__(self, token: str, delay: float):
+        """Задаёт токен и минимальный интервал между началами запросов.
+
+        Время последнего запроса хранится только в памяти текущего запуска.
+        """
         self.token = token
         self.delay = delay
         self.last_request = None
 
     def call_api(self, method: str, params: dict):
+        """Один раз вызывает метод VK и возвращает содержимое поля response.
+
+        Выдерживает заданный интервал, отправляет параметры через curl и разбирает
+        JSON. Ошибки API передаёт как VKError, ошибки сети и ответа — как RuntimeError;
+        решение о продолжении сбора принимает вызывающий код.
+        """
         if self.last_request is not None:
             time.sleep(max(0, self.delay - (time.monotonic() - self.last_request)))
-        # Send the token through stdin, so it does not appear in process arguments.
+        # Токен передаём через stdin, чтобы он не попал в аргументы процесса curl.
         self.last_request = time.monotonic()
         try:
             result = subprocess.run(
@@ -61,6 +79,11 @@ class VKClient:
 
 
 def normalize_profile(value: str) -> str:
+    """Приводит ссылку, короткое имя или запись id123 к идентификатору профиля.
+
+    Для ссылки проверяет домен VK; числовой ID возвращает строкой без префикса id.
+    Числовой ID по короткому имени здесь не запрашивается: это задача resolve_seeds.
+    """
     value = value.strip()
     if "://" in value:
         parsed = urlparse(value)
@@ -75,6 +98,11 @@ def normalize_profile(value: str) -> str:
 
 
 def load_seeds(path: Path) -> list[tuple[str, str]]:
+    """Читает исходные профили из CSV и возвращает пары «группа, профиль».
+
+    Поддерживает две колонки group,profile и список из одной колонки.
+    Пропускает пустые строки и комментарии, убирает повторы внутри одной группы.
+    """
     with path.open(newline="", encoding="utf-8-sig") as file:
         rows = [row for row in csv.reader(file)
                 if row and any(cell.strip() for cell in row) and not row[0].lstrip().startswith("#")]
@@ -93,6 +121,11 @@ def load_seeds(path: Path) -> list[tuple[str, str]]:
 
 
 def resolve_seeds(client: VKClient, records: list[tuple[str, str]]) -> dict[int, set[str]]:
+    """Возвращает соответствие числовых ID исходных профилей множествам их групп.
+
+    Короткие имена разрешает через users.get, готовые ID использует сразу.
+    В пределах вызова одно имя разрешается один раз, даже если оно есть в разных группах.
+    """
     groups: dict[int, set[str]] = {}
     resolved = {}
     for group, profile in records:
@@ -109,6 +142,11 @@ def resolve_seeds(client: VKClient, records: list[tuple[str, str]]) -> dict[int,
 
 
 def get_friends(client: VKClient, user: int) -> list[int]:
+    """Получает полный список ID друзей одного профиля с учётом страниц ответа.
+
+    Запрашивает до 5000 записей за раз и увеличивает offset на полученное число.
+    При ошибке не возвращает частичный список, чтобы тот не попал в кэш как полный.
+    """
     friends = []
     while True:
         result = client.call_api("friends.get", {"user_id": user, "count": 5000, "offset": len(friends)})
@@ -121,6 +159,7 @@ def get_friends(client: VKClient, user: int) -> list[int]:
 
 
 def progress(label: str, done: int, total: int, errors: int) -> None:
+    """Обновляет строку прогресса прохода: обработанные профили и число ошибок."""
     width = 24
     filled = width * done // max(1, total)
     print(f"\r{label}: [{'#' * filled}{'.' * (width - filled)}] {done}/{total}; errors: {errors}",
@@ -129,6 +168,13 @@ def progress(label: str, done: int, total: int, errors: int) -> None:
 
 def collect_friends(client: VKClient, seeds: dict[int, set[str]], cache: dict[str, list[int]],
                     cache_path: Path, errors: list[dict], passes: int, max_users: int) -> None:
+    """Обходит исходные профили и их друзей, дополняя кэш полными списками.
+
+    Каждый новый список сразу сохраняет в cache_path; записи кэша повторно
+    не запрашивает. Два прохода открывают два круга вершин; третий запрашивает
+    списки второго круга, но не расширяет выбранную область до третьего.
+    Ошибки отдельных профилей добавляет в errors, остальные передаёт в main.
+    """
     selected = frontier = set(seeds)
     attempted = set()
     for depth in range(passes):
@@ -142,17 +188,19 @@ def collect_friends(client: VKClient, seeds: dict[int, set[str]], cache: dict[st
                 if max_users and len(attempted) >= max_users:
                     print("\nReached --max-users; saving the partial graph.", file=sys.stderr)
                     return
+                # Лимит считает профили, а не страницы запросов friends.get.
                 attempted.add(user)
                 try:
                     friends = get_friends(client, user)
                 except (VKError, RuntimeError) as exc:
                     errors.append({"user_id": user, "depth": depth, "error": str(exc)})
-                    # These errors concern one profile. All other failures stop the run.
+                    # Ошибки доступа относятся к одному профилю; остальные ошибки останавливают сбор.
                     if not isinstance(exc, VKError) or exc.code not in {15, 18, 30, 113, 200}:
                         raise
                 else:
                     cache[key] = friends
                     save_json(cache_path, cache)
+            # Дополнительный проход уточняет связи границы, не открывая третий круг.
             if depth < 2:
                 discoveries.update(cache.get(key, []))
             progress(label, index, len(users), len(errors))
@@ -161,12 +209,17 @@ def collect_friends(client: VKClient, seeds: dict[int, set[str]], cache: dict[st
 
 
 def export_graph(directory: Path, seeds: dict[int, set[str]], cache: dict[str, list[int]]) -> tuple[int, int]:
-    """Derive a two-hop graph from all saved lists, including earlier runs."""
+    """Строит по всему кэшу граф двух кругов и записывает nodes.csv и edges.csv.
+
+    Восстанавливает множество вершин в том числе из списков прежних запусков.
+    Сохраняет только внутренние связи, без петель и повторов; возвращает
+    число записанных вершин и рёбер.
+    """
     selected = frontier = set(seeds)
     for _ in range(2):
         frontier = {friend for user in frontier for friend in cache.get(str(user), [])} - selected
         selected = selected | frontier
-    # Per-list sets avoid storing millions of edge tuples just to deduplicate them.
+    # Множества друзей убирают повторы без хранения миллионов отдельных пар рёбер.
     lists = {int(user): set(friends) for user, friends in cache.items() if int(user) in selected}
     nodes_path, edges_path = directory / "nodes.csv", directory / "edges.csv"
     with nodes_path.with_suffix(".csv.tmp").open("w", newline="", encoding="utf-8") as file:
@@ -182,6 +235,7 @@ def export_graph(directory: Path, seeds: dict[int, set[str]], cache: dict[str, l
             for target in sorted(lists[source]):
                 if target not in selected or source == target:
                     continue
+                # Взаимную связь пишем один раз; связь из одного списка тоже сохраняем.
                 if source < target or source not in lists.get(target, ()):
                     writer.writerow([min(source, target), max(source, target)])
                     edge_count += 1
@@ -191,6 +245,12 @@ def export_graph(directory: Path, seeds: dict[int, set[str]], cache: dict[str, l
 
 
 def main() -> int:
+    """Запускает сбор по аргументам командной строки и экспортирует доступный граф.
+
+    Загружает исходные профили и кэш, обрабатывает остановку и пишет журнал ошибок.
+    Возвращает код завершения: 0 — проход окончен или достигнут лимит профилей,
+    2 — ошибка, 130 — прерывание пользователем.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seeds", type=Path, default=Path("seeds.csv"), help="CSV: group,profile or one profile per line")
     parser.add_argument("--out", type=Path, default=Path("data"), help="output directory")

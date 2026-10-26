@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calculate betweenness, closeness, and eigenvector centrality from graph CSVs."""
+"""Расчёт трёх центральностей для всех вершин графа и сохранение значений и топов."""
 
 from __future__ import annotations
 
@@ -22,16 +22,24 @@ except ImportError:
 
 
 def log(message: str) -> None:
+    """Сразу выводит сообщение в stderr, чтобы ход долгих вычислений был виден в терминале."""
     print(message, file=sys.stderr, flush=True)
 
 
 class Progress:
+    """Показывает прогресс этапа, прошедшее время и оценку оставшегося времени."""
+
     def __init__(self, label: str, total: int):
+        """Запоминает начало этапа, его название и общее число операций."""
         self.label, self.total = label, total
         self.started = self.last = time.monotonic()
         log(f"{label}: 0/{total}")
 
     def update(self, done: int) -> None:
+        """Обновляет прогресс не чаще раза в секунду и обязательно при завершении.
+
+        Оставшееся время оценивает по средней скорости уже выполненных операций.
+        """
         now = time.monotonic()
         if done != self.total and now - self.last < 1:
             return
@@ -42,8 +50,14 @@ class Progress:
 
 
 def load_native_graph(nodes_path: Path, edges_path: Path):
-    """Keep IDs and edges compact; avoid millions of Python adjacency sets."""
+    """Загружает CSV в неориентированный граф igraph и возвращает граф и массив ID.
+
+    Сопоставляет внешние ID VK последовательным индексам вершин igraph.
+    Хранит ID и пары индексов в компактных массивах, затем удаляет петли и
+    повторные рёбра; изолированные вершины из nodes.csv сохраняются.
+    """
     ids = array("q")
+    # Внутренние индексы igraph идут подряд, независимо от величины ID VK.
     lookup = {}
     with nodes_path.open(newline="", encoding="utf-8-sig") as file:
         for row in csv.DictReader(file):
@@ -67,12 +81,19 @@ def load_native_graph(nodes_path: Path, edges_path: Path):
             if index % 500000 == 0:
                 log(f"Loading edges: {index:,}")
     graph = ig.Graph(n=len(ids), edges=np.frombuffer(edges, dtype=np.int64).reshape(-1, 2), directed=False)
+    # Центральности считаем на простом графе: без петель и кратных рёбер.
     graph.simplify()
     return graph, np.frombuffer(ids, dtype=np.int64)
 
 
 def native_closeness(graph, groups: list[list[int]], samples: int, seed: int):
-    """WF closeness, estimated from within-component mean pivot distances."""
+    """Вычисляет близость с поправкой Wasserman–Faust для всех вершин.
+
+    В небольшой компоненте считает точные значения, в большой — оценивает
+    средние расстояния по samples случайным опорным вершинам. Поправка учитывает
+    долю достижимых вершин во всём графе. Изолированным вершинам оставляет ноль;
+    фиксированный seed воспроизводит выборку.
+    """
     n = graph.vcount()
     scores = np.zeros(n)
     total = sum(min(samples, len(group)) for group in groups if len(group) > 1)
@@ -83,6 +104,7 @@ def native_closeness(graph, groups: list[list[int]], samples: int, seed: int):
         if size <= 1:
             continue
         subgraph = graph if size == n else graph.induced_subgraph(vertices)
+        # Поправка снижает близость вершин маленьких, изолированных от остальных компонент.
         correction = (size - 1) / (n - 1)
         count = min(samples, size)
         if count == size:
@@ -97,7 +119,7 @@ def native_closeness(graph, groups: list[list[int]], samples: int, seed: int):
         counts = np.full(size, count, dtype=np.int32)
         for pivot in pivots:
             sums += np.asarray(subgraph.distances(source=[pivot])[0], dtype=np.float64)
-            counts[pivot] -= 1  # Exclude distance to oneself, as in exact closeness.
+            counts[pivot] -= 1  # Нулевое расстояние до себя не входит в среднее.
             done += 1
             progress.update(done)
         scores[vertices] = correction * np.divide(counts, sums, out=np.zeros(size), where=sums > 0)
@@ -106,14 +128,22 @@ def native_closeness(graph, groups: list[list[int]], samples: int, seed: int):
 
 
 def native_eigenvector(graph, groups: list[list[int]]):
+    """Вычисляет центральность собственного вектора отдельно в каждой компоненте.
+
+    Использует численный решатель igraph без выборки и приводит каждый вектор
+    к L2-норме 1. Для одиночной вершины принято значение 1; значения из разных
+    компонент с такой нормировкой напрямую не сравниваются.
+    """
     scores = np.zeros(graph.vcount())
     progress = Progress("Eigenvector components", len(groups))
     for index, vertices in enumerate(groups, 1):
+        # Для изолированной вершины используем принятую в проекте отдельную условность.
         if len(vertices) == 1:
             scores[vertices[0]] = 1.0
         else:
             subgraph = graph if len(vertices) == graph.vcount() else graph.induced_subgraph(vertices)
             vector = np.asarray(subgraph.eigenvector_centrality(), dtype=np.float64)
+            # Знак собственного вектора произволен: выбираем положительное направление.
             if vector.sum() < 0:
                 vector = -vector
             norm = np.linalg.norm(vector)
@@ -125,6 +155,12 @@ def native_eigenvector(graph, groups: list[list[int]]):
 
 
 def native_betweenness(graph, samples: int, seed: int):
+    """Вычисляет нормированное посредничество для всех вершин графа.
+
+    Обрабатывает все источники, если samples достаточно, иначе берёт случайную
+    выборку с заданным seed. Складывает вклады обходов небольшими порциями,
+    масштабирует выборку на n/k и применяет нормировку неориентированного графа.
+    """
     n = graph.vcount()
     if n <= 2:
         return np.zeros(n)
@@ -136,15 +172,27 @@ def native_betweenness(graph, samples: int, seed: int):
         end = min(start + 4, count)
         raw += np.asarray(graph.betweenness(directed=False, sources=sources[start:end]))
         progress.update(end)
+    # n/k оценивает вклад всех источников; второй множитель нормирует неориентированный граф.
     return raw * (n / count) * 2.0 / ((n - 1) * (n - 2))
 
 
 def file_signature(path: Path) -> dict:
+    """Возвращает путь, размер и время изменения файла.
+
+    Эти признаки позволяют заметить изменение входного графа во время анализа
+    и не сохранить метрики, рассчитанные по смешанным версиям данных.
+    """
     stat = path.stat()
     return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
 def main() -> int:
+    """Запускает расчёт метрик или формирует топы из уже готового CSV.
+
+    В режиме анализа загружает граф, выбирает точный или выборочный расчёт,
+    сохраняет значения для всех вершин и метаданные методов, затем создаёт топы.
+    Режим --rank-only читает готовый результат без пересчёта центральностей.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nodes", type=Path, default=Path("data/nodes.csv"))
     parser.add_argument("--edges", type=Path, default=Path("data/edges.csv"))

@@ -1,4 +1,4 @@
-"""Stream centrality CSVs into small rankings without loading all rows."""
+"""Потоковое чтение центральностей и сохранение компактных рейтингов в CSV и Markdown."""
 
 import csv
 import heapq
@@ -9,13 +9,20 @@ from pathlib import Path
 
 
 def export_top_rankings(source: Path, top: int = 10) -> Path:
-    """Stream the full result once; export small, explicitly labelled rankings."""
+    """Создаёт отдельные CSV топов и общий Markdown-отчёт по трём центральностям.
+
+    Читает исходный CSV один раз, удерживая в памяти только top лучших записей
+    для каждой метрики. Точность расчёта определяет по метаданным, а не имени
+    файла; при равных значениях ставит меньший ID выше. Проверяет конечность
+    оценок и согласованность числа строк с метаданными. Возвращает путь к отчёту.
+    """
     if top < 1:
         raise ValueError("top must be positive")
     before = source.stat()
     metadata_path = source.with_suffix(".meta.json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
     metrics = ("betweenness", "closeness", "eigenvector")
+    # Корень каждой кучи — худшая запись текущего топа: её первой заменяет лучший кандидат.
     heaps: dict[str, list[tuple[float, int]]] = {name: [] for name in metrics}
     rows = 0
     with source.open(newline="", encoding="utf-8-sig") as file:
@@ -25,7 +32,7 @@ def export_top_rankings(source: Path, top: int = 10) -> Path:
                 score = float(row[name])
                 if not math.isfinite(score):
                     raise ValueError(f"non-finite {name} for user {user}")
-                item = (score, -user)  # Equal scores: smaller VK ID first.
+                item = (score, -user)  # При равной оценке меньший ID должен стоять выше.
                 heap = heaps[name]
                 if len(heap) < top:
                     heapq.heappush(heap, item)
@@ -37,6 +44,7 @@ def export_top_rankings(source: Path, top: int = 10) -> Path:
         raise RuntimeError("centrality CSV changed while exporting rankings")
     if "vertex_count" in metadata and rows != metadata["vertex_count"]:
         raise ValueError("centrality CSV row count does not match its method metadata")
+    # Имя файла может вводить в заблуждение; способ расчёта берём только из метаданных.
     methods = {
         "betweenness": ("exact_on_observed_graph" if metadata.get("betweenness_method") == "exact"
                         else "approximate" if "betweenness_method" in metadata else "unknown"),
